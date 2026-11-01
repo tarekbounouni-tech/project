@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Version** | 1.0 — à valider |
+| **Version** | 1.0 — validée |
 | **Date** | 1er novembre 2026 |
 | **Références** | [Cahier des charges v1.1](cahier-des-charges.md) · [Architecture 2.1](02-architecture.md) |
 | **Scripts SQL** | [`backend/db/migrations/`](../backend/db/migrations) · [`backend/db/seeds/dev_seed.sql`](../backend/db/seeds/dev_seed.sql) |

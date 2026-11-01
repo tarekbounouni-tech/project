@@ -1,0 +1,11 @@
+# Configuration du linter OpenAPI (Redocly CLI)
+# Exécution : npx @redocly/cli lint api/openapi.yaml --config api/redocly.yaml
+extends:
+  - recommended
+rules:
+  # Le serveur localhost est volontaire (développement local).
+  no-server-example.com: off
+  # Projet propriétaire, pas d'URL de licence.
+  info-license-strict: off
+  # Les sondes de santé, les référentiels et la déconnexion n'ont pas de cas d'erreur 4xx.
+  operation-4xx-response: off

@@ -1,0 +1,3542 @@
+# =============================================================================
+# Contrat d'API — VolleySpot (nom provisoire)
+# -----------------------------------------------------------------------------
+# SOURCE DE VÉRITÉ de l'API (décision D-03) :
+#   * le backend Go génère ses types et l'interface de ses handlers depuis ce
+#     fichier (oapi-codegen, mode strict server, routeur chi) ;
+#   * l'app mobile et le back-office génèrent leur client TypeScript depuis ce
+#     fichier (openapi-typescript + openapi-fetch).
+# Toute évolution de l'API commence par une modification de ce fichier.
+#
+# Conventions (voir docs/04-api.md) :
+#   * JSON, champs en camelCase, dates « YYYY-MM-DD », heures « HH:MM »,
+#     horodatages ISO 8601 en UTC ;
+#   * erreurs au format RFC 9457 (application/problem+json) ;
+#   * pagination par curseur opaque (nextCursor) ;
+#   * les codes des référentiels (formats, niveaux…) sont envoyés seuls ; leurs
+#     libellés sont fournis une fois par GET /v1/reference.
+# =============================================================================
+openapi: 3.0.3
+
+info:
+  title: VolleySpot API
+  version: 1.0.0
+  description: |
+    API REST de la plateforme de tournois de volley-ball.
+
+    Trois espaces :
+    - **Public** : consultation des tournois, propositions et signalements (sans compte).
+    - **Utilisateur** (`/v1/me`) : compte et favoris (jeton requis).
+    - **Administration** (`/v1/admin`) : gestion du catalogue et modération (rôle `admin`).
+  contact:
+    name: VolleySpot
+  license:
+    name: Propriétaire
+
+servers:
+  - url: http://localhost:8080
+    description: Développement local
+  - url: https://api.volleyspot.app
+    description: Production (domaine provisoire)
+
+tags:
+  - name: Système
+    description: Santé du service
+  - name: Référentiels
+    description: Listes de valeurs et communes
+  - name: Tournois
+    description: Consultation publique des tournois
+  - name: Organisateurs
+    description: Consultation publique des organisateurs
+  - name: Contributions
+    description: Propositions de tournois et signalements (sans compte)
+  - name: Médias
+    description: Envoi d'images
+  - name: Authentification
+    description: Inscription, connexion, sessions, mot de passe
+  - name: Mon compte
+    description: Profil et suppression du compte
+  - name: Favoris
+    description: Tournois enregistrés par l'utilisateur
+  - name: Admin — Tableau de bord
+    description: Indicateurs du back-office
+  - name: Admin — Tournois
+    description: Gestion des éditions, publication, duplication
+  - name: Admin — Séries
+    description: Tournois récurrents
+  - name: Admin — Organisateurs
+    description: Clubs et autres organisateurs
+  - name: Admin — Lieux
+    description: Lieux et géocodage des adresses
+  - name: Admin — Propositions
+    description: Modération des tournois proposés
+  - name: Admin — Signalements
+    description: Traitement des signalements
+
+# Par défaut, aucune authentification n'est requise : chaque opération qui en
+# a besoin le déclare explicitement.
+security: []
+
+paths:
+  # ===========================================================================
+  # SYSTÈME
+  # ===========================================================================
+  /healthz:
+    get:
+      tags: [Système]
+      operationId: getHealth
+      summary: Le service répond (sonde de vivacité)
+      responses:
+        "200":
+          description: Service démarré
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+  /readyz:
+    get:
+      tags: [Système]
+      operationId: getReadiness
+      summary: Le service et la base de données sont disponibles (sonde de disponibilité)
+      responses:
+        "200":
+          description: Prêt
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  # ===========================================================================
+  # RÉFÉRENTIELS
+  # ===========================================================================
+  /v1/reference:
+    get:
+      tags: [Référentiels]
+      operationId: getReferenceData
+      summary: Toutes les listes de valeurs en un appel
+      description: |
+        Formats, catégories, niveaux, terrains, badges, types d'organisateurs,
+        régions et départements (avec leur statut d'ouverture). Réponse mise en
+        cache par les clients ; change très rarement.
+      responses:
+        "200":
+          description: Référentiels
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControl"
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReferenceData"
+
+  /v1/cities:
+    get:
+      tags: [Référentiels]
+      operationId: searchCities
+      summary: Auto-complétion des communes
+      description: Recherche par nom (insensible casse, accents, fautes légères) ou par code postal.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Début du nom ou code postal (2 caractères minimum)
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 100
+        - name: activeOnly
+          in: query
+          description: Limiter aux départements ouverts dans l'application
+          schema:
+            type: boolean
+            default: false
+        - $ref: "#/components/parameters/SmallLimit"
+      responses:
+        "200":
+          description: Communes correspondantes, les plus pertinentes d'abord
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/City"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  # ===========================================================================
+  # TOURNOIS (PUBLIC)
+  # ===========================================================================
+  /v1/tournaments:
+    get:
+      tags: [Tournois]
+      operationId: listTournaments
+      summary: Liste et recherche des tournois publiés
+      description: |
+        Tournois publiés, triés par date de début (ou date décroissante pour
+        `period=past`). Tous les filtres sont facultatifs et combinables.
+        Les filtres de tableau (format, catégorie, niveau, terrain) retiennent
+        un tournoi si **au moins un de ses tableaux** correspond à tous ces
+        filtres à la fois. Un filtre répété (`format=2x2&format=4x4`) signifie
+        « l'un ou l'autre ».
+      parameters:
+        - $ref: "#/components/parameters/Period"
+        - $ref: "#/components/parameters/SearchQuery"
+        - $ref: "#/components/parameters/DepartmentFilter"
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+        - $ref: "#/components/parameters/FormatFilter"
+        - $ref: "#/components/parameters/CategoryFilter"
+        - $ref: "#/components/parameters/LevelFilter"
+        - $ref: "#/components/parameters/SurfaceFilter"
+        - name: organizerId
+          in: query
+          description: Tournois d'un organisateur
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Une page de tournois
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TournamentSummaryPage"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /v1/tournaments/{tournamentId}:
+    parameters:
+      - $ref: "#/components/parameters/TournamentId"
+    get:
+      tags: [Tournois]
+      operationId: getTournament
+      summary: Fiche détaillée d'un tournoi publié
+      responses:
+        "200":
+          description: Fiche tournoi
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TournamentDetail"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/tournaments/{tournamentId}/events:
+    parameters:
+      - $ref: "#/components/parameters/TournamentId"
+    post:
+      tags: [Tournois]
+      operationId: recordTournamentEvent
+      summary: Comptabiliser une vue de fiche ou un clic « S'inscrire » (anonyme)
+      description: Statistiques anonymes (RG-16). Aucune donnée personnelle n'est enregistrée.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TournamentEventInput"
+      responses:
+        "204":
+          description: Enregistré
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/tournaments/{tournamentId}/reports:
+    parameters:
+      - $ref: "#/components/parameters/TournamentId"
+    post:
+      tags: [Contributions]
+      operationId: createReport
+      summary: Signaler une erreur sur une fiche
+      description: Accessible sans compte. Si l'utilisateur est connecté, le signalement lui est rattaché.
+      security:
+        - {}
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReportInput"
+      responses:
+        "201":
+          description: Signalement enregistré
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatedResource"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  # ===========================================================================
+  # ORGANISATEURS (PUBLIC)
+  # ===========================================================================
+  /v1/organizers/{organizerId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizerId"
+    get:
+      tags: [Organisateurs]
+      operationId: getOrganizer
+      summary: Fiche publique d'un organisateur
+      description: Ses tournois s'obtiennent via `GET /v1/tournaments?organizerId=…`.
+      responses:
+        "200":
+          description: Organisateur
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrganizerPublic"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ===========================================================================
+  # CONTRIBUTIONS
+  # ===========================================================================
+  /v1/submissions:
+    post:
+      tags: [Contributions]
+      operationId: createSubmission
+      summary: Proposer un tournoi
+      description: |
+        Accessible sans compte. La proposition arrive dans la file de
+        modération (RG-09). Pour joindre une affiche, l'envoyer d'abord via
+        `POST /v1/media` puis indiquer son identifiant.
+      security:
+        - {}
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmissionInput"
+      responses:
+        "201":
+          description: Proposition enregistrée, en attente de validation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatedResource"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  # ===========================================================================
+  # MÉDIAS
+  # ===========================================================================
+  /v1/media:
+    post:
+      tags: [Médias]
+      operationId: uploadMedia
+      summary: Envoyer une image (affiche ou logo)
+      description: |
+        JPEG, PNG ou WebP, 10 Mo maximum. L'image est vérifiée, débarrassée de
+        ses métadonnées (EXIF), redimensionnée en deux tailles puis stockée.
+        - **Sans compte** : uniquement `kind=poster`, image non publique
+          jusqu'à validation de la proposition associée ; débit limité.
+        - **Administrateur** : image publique immédiatement.
+        Les images non rattachées à un contenu sous 24 h sont supprimées.
+      security:
+        - {}
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, kind]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Fichier image (≤ 10 Mo)
+                kind:
+                  $ref: "#/components/schemas/MediaKind"
+            encoding:
+              file:
+                contentType: image/jpeg, image/png, image/webp
+      responses:
+        "201":
+          description: Image enregistrée
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Media"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  # ===========================================================================
+  # AUTHENTIFICATION
+  # ===========================================================================
+  /v1/auth/register:
+    post:
+      tags: [Authentification]
+      operationId: register
+      summary: Créer un compte
+      description: Un e-mail de vérification est envoyé. L'utilisateur est connecté immédiatement.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterInput"
+      responses:
+        "201":
+          description: Compte créé
+          headers:
+            Set-Cookie:
+              $ref: "#/components/headers/RefreshCookie"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthSession"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/auth/login:
+    post:
+      tags: [Authentification]
+      operationId: login
+      summary: Se connecter
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginInput"
+      responses:
+        "200":
+          description: Connecté
+          headers:
+            Set-Cookie:
+              $ref: "#/components/headers/RefreshCookie"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthSession"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/auth/refresh:
+    post:
+      tags: [Authentification]
+      operationId: refreshSession
+      summary: Renouveler la session
+      description: |
+        Échange un jeton de renouvellement contre une nouvelle paire de jetons
+        (rotation). Le jeton est lu dans le corps (application mobile) ou, à
+        défaut, dans le cookie `refresh_token` (back-office web).
+        La réutilisation d'un jeton déjà échangé révoque toute la session.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshInput"
+      responses:
+        "200":
+          description: Nouveaux jetons
+          headers:
+            Set-Cookie:
+              $ref: "#/components/headers/RefreshCookie"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthSession"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/auth/logout:
+    post:
+      tags: [Authentification]
+      operationId: logout
+      summary: Se déconnecter (révoque le jeton de renouvellement)
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshInput"
+      responses:
+        "204":
+          description: Déconnecté (réponse identique si le jeton était déjà invalide)
+
+  /v1/auth/verify-email:
+    post:
+      tags: [Authentification]
+      operationId: verifyEmail
+      summary: Confirmer l'adresse e-mail (lien reçu par e-mail)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenInput"
+      responses:
+        "204":
+          description: Adresse confirmée
+        "410":
+          $ref: "#/components/responses/Gone"
+
+  /v1/auth/resend-verification:
+    post:
+      tags: [Authentification]
+      operationId: resendVerificationEmail
+      summary: Renvoyer l'e-mail de vérification
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: E-mail renvoyé (ou adresse déjà vérifiée)
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/auth/forgot-password:
+    post:
+      tags: [Authentification]
+      operationId: forgotPassword
+      summary: Demander un lien de réinitialisation du mot de passe
+      description: |
+        Réponse identique que l'adresse existe ou non (ne révèle pas quels
+        e-mails ont un compte). Le lien est valable 1 heure.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  $ref: "#/components/schemas/Email"
+      responses:
+        "202":
+          description: Demande prise en compte
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /v1/auth/reset-password:
+    post:
+      tags: [Authentification]
+      operationId: resetPassword
+      summary: Définir un nouveau mot de passe (lien reçu par e-mail)
+      description: Toutes les sessions existantes sont révoquées.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, newPassword]
+              properties:
+                token:
+                  type: string
+                  minLength: 20
+                  maxLength: 200
+                newPassword:
+                  $ref: "#/components/schemas/Password"
+      responses:
+        "204":
+          description: Mot de passe modifié
+        "410":
+          $ref: "#/components/responses/Gone"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  # ===========================================================================
+  # MON COMPTE
+  # ===========================================================================
+  /v1/me:
+    get:
+      tags: [Mon compte]
+      operationId: getMe
+      summary: Mon profil
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Profil
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    patch:
+      tags: [Mon compte]
+      operationId: updateMe
+      summary: Modifier mon profil
+      description: Seuls les champs présents sont modifiés ; `null` efface une valeur facultative.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateMeInput"
+      responses:
+        "200":
+          description: Profil mis à jour
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /v1/me/password:
+    put:
+      tags: [Mon compte]
+      operationId: changePassword
+      summary: Changer mon mot de passe
+      description: Les autres sessions sont révoquées.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword:
+                  type: string
+                  maxLength: 128
+                newPassword:
+                  $ref: "#/components/schemas/Password"
+      responses:
+        "204":
+          description: Mot de passe modifié
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /v1/me/account-deletion:
+    post:
+      tags: [Mon compte]
+      operationId: deleteMyAccount
+      summary: Supprimer définitivement mon compte
+      description: |
+        Exigence RGPD, Google Play et App Store. Efface le compte, les favoris
+        et toutes les sessions. Irréversible. Le mot de passe est demandé pour
+        confirmer.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password:
+                  type: string
+                  maxLength: 128
+      responses:
+        "204":
+          description: Compte supprimé
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ===========================================================================
+  # FAVORIS
+  # ===========================================================================
+  /v1/me/favorites:
+    get:
+      tags: [Favoris]
+      operationId: listMyFavorites
+      summary: Mes tournois favoris
+      description: Inclut les tournois annulés ou reportés (avec leur statut) pour que l'utilisateur soit informé.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Period"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Une page de favoris
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TournamentSummaryPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/me/favorites/ids:
+    get:
+      tags: [Favoris]
+      operationId: listMyFavoriteIds
+      summary: Identifiants de tous mes favoris
+      description: Permet d'afficher les cœurs « remplis » dans les listes sans charger les fiches.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Identifiants
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ids]
+                properties:
+                  ids:
+                    type: array
+                    items:
+                      type: string
+                      format: uuid
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/me/favorites/{tournamentId}:
+    parameters:
+      - $ref: "#/components/parameters/TournamentId"
+    put:
+      tags: [Favoris]
+      operationId: addFavorite
+      summary: Ajouter un favori (idempotent)
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Ajouté (ou déjà présent)
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Favoris]
+      operationId: removeFavorite
+      summary: Retirer un favori (idempotent)
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Retiré (ou absent)
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ===========================================================================
+  # ADMINISTRATION — TABLEAU DE BORD
+  # ===========================================================================
+  /v1/admin/dashboard:
+    get:
+      tags: [Admin — Tableau de bord]
+      operationId: adminGetDashboard
+      summary: Indicateurs du back-office
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Indicateurs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminDashboard"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  # ===========================================================================
+  # ADMINISTRATION — TOURNOIS
+  # ===========================================================================
+  /v1/admin/tournaments:
+    get:
+      tags: [Admin — Tournois]
+      operationId: adminListTournaments
+      summary: Tous les tournois, quel que soit leur statut
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: publicationStatus
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              $ref: "#/components/schemas/PublicationStatus"
+        - $ref: "#/components/parameters/SearchQuery"
+        - $ref: "#/components/parameters/DepartmentFilter"
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+        - name: organizerId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: seriesId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: staleOnly
+          in: query
+          description: Uniquement les tournois à venir non vérifiés depuis plus de 30 jours (RG-07)
+          schema:
+            type: boolean
+            default: false
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Une page de tournois
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminTournamentSummaryPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Admin — Tournois]
+      operationId: adminCreateTournament
+      summary: Créer un tournoi (brouillon)
+      description: |
+        Crée une édition en brouillon, avec ses tableaux. La série est soit
+        existante (`seriesId`), soit créée à la volée (`newSeries`). Le lieu est
+        soit existant (`venueId`), soit créé à la volée (`newVenue`).
+        Si `submissionId` est fourni, la proposition correspondante est marquée
+        acceptée et liée au tournoi, dans la même transaction.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminTournamentCreateInput"
+      responses:
+        "201":
+          description: Tournoi créé
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminTournament"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /v1/admin/tournaments/{tournamentId}:
+    parameters:
+      - $ref: "#/components/parameters/TournamentId"
+    get:
+      tags: [Admin — Tournois]
+      operationId: adminGetTournament
+      summary: Tournoi complet (y compris les champs internes)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Tournoi
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminTournament"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [Admin — Tournois]
+      operationId: adminUpdateTournament
+      summary: Remplacer le contenu d'un tournoi
+      description: |
+        Remplace toutes les informations éditables, **y compris la liste des
+        tableaux** (les tableaux absents sont supprimés, ceux sans `id` sont
+        créés). Met à jour la date de vérification (RG-07).
+        Le statut de publication se change uniquement via les actions dédiées
+        (`/publish`, `/reject`, `/archive`).
+        `version` (valeur de `updatedAt` lue) protège contre l'écrasement
+        d'une modification concurrente : 409 si le tournoi a changé entre-temps.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminTournamentUpdateInput"
+      responses:
+        "200":
+          description: Tournoi mis à jour
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminTournament"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+    delete:
+      tags: [Admin — Tournois]
+      operationId: adminDeleteTournament
+      summary: Supprimer un tournoi jamais publié
+      description: Seuls les brouillons et tournois refusés peuvent être supprimés ; un tournoi publié s'archive (RG-04).
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Supprimé
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /v1/admin/tournaments/{tournamentId}/publish:
+    parameters:
+      - $ref: "#/components/parameters/TournamentId"
+    post:
+      tags: [Admin — Tournois]
+      operationId: adminPublishTournament
+      summary: Publier (brouillon ou en attente → publié)
+      description: Vérifie qu'il existe au moins un tableau et que chaque tableau a au moins un niveau.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Publié
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminTournament"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/InvalidTransition"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /v1/admin/tournaments/{tournamentId}/reject:
+    parameters:
+      - $ref: "#/components/parameters/TournamentId"
+    post:
+      tags: [Admin — Tournois]
+      operationId: adminRejectTournament
+      summary: Refuser (en attente → refusé)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReasonInput"
+      responses:
+        "200":
+          description: Refusé
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminTournament"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/InvalidTransition"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /v1/admin/tournaments/{tournamentId}/archive:
+    parameters:
+      - $ref: "#/components/parameters/TournamentId"
+    post:
+      tags: [Admin — Tournois]
+      operationId: adminArchiveTournament
+      summary: Archiver (publié → archivé, retiré de l'application)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Archivé
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminTournament"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/InvalidTransition"
+
+  /v1/admin/tournaments/{tournamentId}/verify:
+    parameters:
+      - $ref: "#/components/parameters/TournamentId"
+    post:
+      tags: [Admin — Tournois]
+      operationId: adminVerifyTournament
+      summary: Confirmer que les informations sont à jour (sans les modifier)
+      description: Met à jour la date « Vérifié le » (RG-07).
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Vérifié
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminTournament"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/admin/tournaments/{tournamentId}/duplicate:
+    parameters:
+      - $ref: "#/components/parameters/TournamentId"
+    post:
+      tags: [Admin — Tournois]
+      operationId: adminDuplicateTournament
+      summary: Créer l'édition suivante d'une série
+      description: |
+        Copie l'édition (lieu, description, tableaux, badges, contacts…) dans
+        un nouveau brouillon de la même série, aux nouvelles dates. Ne copie
+        pas : statuts, lien et date limite d'inscription, statistiques.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DuplicateInput"
+      responses:
+        "201":
+          description: Nouvelle édition (brouillon)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminTournament"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /v1/admin/tournaments/{tournamentId}/stats:
+    parameters:
+      - $ref: "#/components/parameters/TournamentId"
+    get:
+      tags: [Admin — Tournois]
+      operationId: adminGetTournamentStats
+      summary: Statistiques quotidiennes d'un tournoi
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+      responses:
+        "200":
+          description: Statistiques
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TournamentStats"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/admin/tournaments/{tournamentId}/history:
+    parameters:
+      - $ref: "#/components/parameters/TournamentId"
+    get:
+      tags: [Admin — Tournois]
+      operationId: adminGetTournamentHistory
+      summary: Historique des modifications d'un tournoi
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Entrées du journal d'audit, les plus récentes d'abord
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditEntryPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/admin/duplicate-candidates:
+    get:
+      tags: [Admin — Tournois]
+      operationId: adminFindDuplicateCandidates
+      summary: Doublons probables d'un tournoi en cours de saisie (RG-10)
+      description: Tournois existants dans la même commune à ± 3 jours, ou au nom similaire à ± 30 jours.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 150
+        - name: startDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: cityInsee
+          in: query
+          schema:
+            $ref: "#/components/schemas/InseeCode"
+        - name: excludeTournamentId
+          in: query
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Doublons probables (liste vide si aucun)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AdminTournamentSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  # ===========================================================================
+  # ADMINISTRATION — SÉRIES
+  # ===========================================================================
+  /v1/admin/series:
+    get:
+      tags: [Admin — Séries]
+      operationId: adminListSeries
+      summary: Rechercher une série (pour rattacher une édition)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/SearchQuery"
+        - name: organizerId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Séries
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SeriesPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/admin/series/{seriesId}:
+    parameters:
+      - name: seriesId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    patch:
+      tags: [Admin — Séries]
+      operationId: adminUpdateSeries
+      summary: Renommer une série ou changer son organisateur
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SeriesUpdateInput"
+      responses:
+        "200":
+          description: Série mise à jour
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Series"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  # ===========================================================================
+  # ADMINISTRATION — ORGANISATEURS
+  # ===========================================================================
+  /v1/admin/organizers:
+    get:
+      tags: [Admin — Organisateurs]
+      operationId: adminListOrganizers
+      summary: Rechercher des organisateurs
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/SearchQuery"
+        - $ref: "#/components/parameters/DepartmentFilter"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Organisateurs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminOrganizerPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Admin — Organisateurs]
+      operationId: adminCreateOrganizer
+      summary: Créer un organisateur
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrganizerInput"
+      responses:
+        "201":
+          description: Organisateur créé
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminOrganizer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /v1/admin/organizers/{organizerId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizerId"
+    get:
+      tags: [Admin — Organisateurs]
+      operationId: adminGetOrganizer
+      summary: Organisateur complet
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Organisateur
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminOrganizer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [Admin — Organisateurs]
+      operationId: adminUpdateOrganizer
+      summary: Modifier un organisateur
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrganizerInput"
+      responses:
+        "200":
+          description: Organisateur mis à jour
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminOrganizer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+    delete:
+      tags: [Admin — Organisateurs]
+      operationId: adminDeleteOrganizer
+      summary: Supprimer un organisateur sans tournoi
+      description: 409 si l'organisateur possède encore des séries (protection contre la perte de données).
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Supprimé
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  # ===========================================================================
+  # ADMINISTRATION — LIEUX ET GÉOCODAGE
+  # ===========================================================================
+  /v1/admin/venues:
+    get:
+      tags: [Admin — Lieux]
+      operationId: adminListVenues
+      summary: Rechercher un lieu existant (pour le réutiliser)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/SearchQuery"
+        - name: cityInsee
+          in: query
+          schema:
+            $ref: "#/components/schemas/InseeCode"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Lieux
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VenuePage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Admin — Lieux]
+      operationId: adminCreateVenue
+      summary: Créer un lieu
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VenueInput"
+      responses:
+        "201":
+          description: Lieu créé
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Venue"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /v1/admin/venues/{venueId}:
+    parameters:
+      - name: venueId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    put:
+      tags: [Admin — Lieux]
+      operationId: adminUpdateVenue
+      summary: Modifier un lieu (affecte toutes les éditions qui l'utilisent)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VenueInput"
+      responses:
+        "200":
+          description: Lieu mis à jour
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Venue"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /v1/admin/geocode:
+    get:
+      tags: [Admin — Lieux]
+      operationId: adminGeocodeAddress
+      summary: Suggestions d'adresses géocodées (API Adresse)
+      description: |
+        Relais vers la Base Adresse Nationale. Chaque suggestion fournit
+        l'adresse normalisée, la commune et les coordonnées, prêtes à être
+        utilisées dans `VenueInput`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 3
+            maxLength: 200
+        - $ref: "#/components/parameters/SmallLimit"
+      responses:
+        "200":
+          description: Suggestions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/GeocodeSuggestion"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  # ===========================================================================
+  # ADMINISTRATION — PROPOSITIONS
+  # ===========================================================================
+  /v1/admin/submissions:
+    get:
+      tags: [Admin — Propositions]
+      operationId: adminListSubmissions
+      summary: File des propositions
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/SubmissionStatus"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Propositions, les plus anciennes d'abord pour `pending`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmissionPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/admin/submissions/{submissionId}:
+    parameters:
+      - $ref: "#/components/parameters/SubmissionId"
+    get:
+      tags: [Admin — Propositions]
+      operationId: adminGetSubmission
+      summary: Détail d'une proposition
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Proposition
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Submission"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/admin/submissions/{submissionId}/reject:
+    parameters:
+      - $ref: "#/components/parameters/SubmissionId"
+    post:
+      tags: [Admin — Propositions]
+      operationId: adminRejectSubmission
+      summary: Refuser une proposition
+      description: |
+        Pour **accepter** une proposition, créer le tournoi via
+        `POST /v1/admin/tournaments` avec `submissionId`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReasonInput"
+      responses:
+        "200":
+          description: Refusée
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Submission"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/InvalidTransition"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /v1/admin/submissions/{submissionId}/mark-spam:
+    parameters:
+      - $ref: "#/components/parameters/SubmissionId"
+    post:
+      tags: [Admin — Propositions]
+      operationId: adminMarkSubmissionSpam
+      summary: Classer une proposition en indésirable
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Classée indésirable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Submission"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/InvalidTransition"
+
+  # ===========================================================================
+  # ADMINISTRATION — SIGNALEMENTS
+  # ===========================================================================
+  /v1/admin/reports:
+    get:
+      tags: [Admin — Signalements]
+      operationId: adminListReports
+      summary: File des signalements
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/ReportStatus"
+        - name: tournamentId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Signalements
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReportPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/admin/reports/{reportId}/resolve:
+    parameters:
+      - $ref: "#/components/parameters/ReportId"
+    post:
+      tags: [Admin — Signalements]
+      operationId: adminResolveReport
+      summary: Marquer un signalement comme traité (la fiche a été corrigée)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Traité
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Report"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/InvalidTransition"
+
+  /v1/admin/reports/{reportId}/dismiss:
+    parameters:
+      - $ref: "#/components/parameters/ReportId"
+    post:
+      tags: [Admin — Signalements]
+      operationId: adminDismissReport
+      summary: Rejeter un signalement (information exacte)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Rejeté
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Report"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/InvalidTransition"
+
+# =============================================================================
+# COMPOSANTS RÉUTILISABLES
+# =============================================================================
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Jeton d'accès (15 minutes) obtenu via /v1/auth/login, /register ou /refresh.
+
+  headers:
+    CacheControl:
+      description: Directive de cache
+      schema:
+        type: string
+        example: public, max-age=3600
+    ETag:
+      description: Empreinte de la ressource (requêtes conditionnelles If-None-Match)
+      schema:
+        type: string
+    RetryAfter:
+      description: Nombre de secondes à attendre avant de réessayer
+      schema:
+        type: integer
+    RefreshCookie:
+      description: |
+        Back-office web uniquement (`client: web`) : cookie `refresh_token`
+        HttpOnly, Secure, SameSite=Strict, limité au chemin /v1/auth.
+      schema:
+        type: string
+
+  # ---------------------------------------------------------------------------
+  # Paramètres
+  # ---------------------------------------------------------------------------
+  parameters:
+    TournamentId:
+      name: tournamentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    OrganizerId:
+      name: organizerId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    SubmissionId:
+      name: submissionId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ReportId:
+      name: reportId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    Cursor:
+      name: cursor
+      in: query
+      description: Curseur opaque renvoyé dans `nextCursor` de la page précédente
+      schema:
+        type: string
+        maxLength: 500
+    Limit:
+      name: limit
+      in: query
+      description: Nombre d'éléments par page
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 50
+        default: 20
+    SmallLimit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 20
+        default: 10
+    Period:
+      name: period
+      in: query
+      description: "`upcoming` (défaut) : tournois non terminés ; `past` : historique (RG-06)"
+      schema:
+        type: string
+        enum: [upcoming, past]
+        default: upcoming
+    SearchQuery:
+      name: q
+      in: query
+      description: Recherche texte (nom du tournoi, organisateur, commune), insensible casse et accents
+      schema:
+        type: string
+        minLength: 2
+        maxLength: 100
+    DepartmentFilter:
+      name: department
+      in: query
+      description: Code(s) de département, répétable (`department=29&department=56`)
+      style: form
+      explode: true
+      schema:
+        type: array
+        maxItems: 10
+        items:
+          $ref: "#/components/schemas/DepartmentCode"
+    FromDate:
+      name: from
+      in: query
+      description: Tournois se terminant à partir de cette date
+      schema:
+        type: string
+        format: date
+    ToDate:
+      name: to
+      in: query
+      description: Tournois commençant au plus tard à cette date
+      schema:
+        type: string
+        format: date
+    FormatFilter:
+      name: format
+      in: query
+      style: form
+      explode: true
+      schema:
+        type: array
+        items:
+          $ref: "#/components/schemas/FormatCode"
+    CategoryFilter:
+      name: category
+      in: query
+      style: form
+      explode: true
+      schema:
+        type: array
+        items:
+          $ref: "#/components/schemas/CategoryCode"
+    LevelFilter:
+      name: level
+      in: query
+      style: form
+      explode: true
+      schema:
+        type: array
+        items:
+          $ref: "#/components/schemas/LevelCode"
+    SurfaceFilter:
+      name: surface
+      in: query
+      style: form
+      explode: true
+      schema:
+        type: array
+        items:
+          $ref: "#/components/schemas/SurfaceCode"
+
+  # ---------------------------------------------------------------------------
+  # Réponses d'erreur (RFC 9457)
+  # ---------------------------------------------------------------------------
+  responses:
+    ValidationError:
+      description: Données invalides (détail par champ)
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Unauthorized:
+      description: Authentification absente, invalide ou expirée
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Forbidden:
+      description: Droits insuffisants
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    NotFound:
+      description: Ressource introuvable
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Conflict:
+      description: Conflit (doublon, modification concurrente, ressource encore utilisée)
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    InvalidTransition:
+      description: Changement de statut non autorisé depuis le statut actuel
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Gone:
+      description: Lien expiré ou déjà utilisé
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    PayloadTooLarge:
+      description: Fichier trop volumineux
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    UnsupportedMediaType:
+      description: Type de fichier non accepté
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    TooManyRequests:
+      description: Trop de requêtes, réessayer plus tard
+      headers:
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    BadGateway:
+      description: Service externe indisponible (ex. API Adresse)
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    ServiceUnavailable:
+      description: Service temporairement indisponible
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+  # ---------------------------------------------------------------------------
+  # Schémas
+  # ---------------------------------------------------------------------------
+  schemas:
+    # ---- Types de base -------------------------------------------------------
+    Email:
+      type: string
+      format: email
+      maxLength: 254
+    Password:
+      type: string
+      minLength: 10
+      maxLength: 128
+      description: 10 caractères minimum
+    HttpUrl:
+      type: string
+      format: uri
+      maxLength: 2000
+      pattern: "^https?://"
+    Phone:
+      type: string
+      pattern: '^\+?[0-9 .()-]{6,20}$'
+    Time:
+      type: string
+      pattern: "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+      description: Heure locale « HH:MM »
+      example: "09:30"
+    InseeCode:
+      type: string
+      pattern: "^([0-9]{2}|2A|2B)[0-9]{3}$"
+      description: Code INSEE de commune
+      example: "56034"
+    DepartmentCode:
+      type: string
+      pattern: "^([0-9]{2}|2A|2B)$"
+      example: "29"
+    PostalCode:
+      type: string
+      pattern: "^[0-9]{5}$"
+      example: "56340"
+    Latitude:
+      type: number
+      format: double
+      minimum: -90
+      maximum: 90
+    Longitude:
+      type: number
+      format: double
+      minimum: -180
+      maximum: 180
+
+    # ---- Codes des référentiels ---------------------------------------------
+    # Ajouter une valeur = migration SQL + mise à jour de cette énumération
+    # (décision volontaire : les clients disposent ainsi de types exhaustifs).
+    FormatCode:
+      type: string
+      enum: ["2x2", "3x3", "4x4", "6x6", other]
+    CategoryCode:
+      type: string
+      enum: [men, women, mixed, open]
+    LevelCode:
+      type: string
+      enum: [beginner, leisure, intermediate, advanced, competitive]
+    SurfaceCode:
+      type: string
+      enum: [indoor, outdoor, sand]
+    TagCode:
+      type: string
+      enum: [charity, telethon, solidarity, special]
+    OrganizerTypeCode:
+      type: string
+      enum: [club, association, municipality, business, individual, other]
+    Role:
+      type: string
+      enum: [user, organizer, admin]
+
+    # ---- Statuts -------------------------------------------------------------
+    PublicationStatus:
+      type: string
+      enum: [draft, pending, published, rejected, archived]
+    EventStatus:
+      type: string
+      enum: [scheduled, postponed, cancelled]
+    RegistrationStatus:
+      type: string
+      enum: [not_open_yet, open, full, closed]
+    RegistrationMode:
+      type: string
+      enum: [external_link, on_site, phone_or_email]
+    SubmissionStatus:
+      type: string
+      enum: [pending, accepted, rejected, spam]
+    ReportReason:
+      type: string
+      enum: [wrong_date, cancelled, dead_link, full, other]
+    ReportStatus:
+      type: string
+      enum: [open, resolved, dismissed]
+    MediaKind:
+      type: string
+      enum: [poster, logo]
+    PriceUnit:
+      type: string
+      enum: [team, player]
+
+    # ---- Erreurs ---------------------------------------------------------------
+    Problem:
+      type: object
+      description: Erreur au format RFC 9457 « Problem Details »
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          description: URI identifiant le type d'erreur
+          example: https://volleyspot.app/errors/validation
+        title:
+          type: string
+          example: Données invalides
+        status:
+          type: integer
+          example: 422
+        detail:
+          type: string
+          example: La date de fin doit être postérieure à la date de début.
+        code:
+          type: string
+          description: Code stable exploitable par les clients
+          example: validation_failed
+        errors:
+          type: array
+          description: Erreurs par champ (validation)
+          items:
+            $ref: "#/components/schemas/FieldError"
+        requestId:
+          type: string
+          description: Identifiant de la requête, à communiquer en cas de signalement de bug
+
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          description: Chemin du champ (ex. `divisions[0].priceCents`)
+          example: endDate
+        message:
+          type: string
+          example: doit être postérieure ou égale à startDate
+
+    # ---- Système ---------------------------------------------------------------
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        version:
+          type: string
+          description: Version déployée (commit)
+
+    CreatedResource:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          format: uuid
+
+    ReasonInput:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 3
+          maxLength: 1000
+
+    # ---- Référentiels ----------------------------------------------------------
+    ReferenceData:
+      type: object
+      required: [formats, categories, levels, surfaces, tags, organizerTypes, regions, departments]
+      properties:
+        formats:
+          type: array
+          items:
+            type: object
+            required: [code, label]
+            properties:
+              code:
+                $ref: "#/components/schemas/FormatCode"
+              label:
+                type: string
+              playersOnCourt:
+                type: integer
+                nullable: true
+        categories:
+          type: array
+          items:
+            type: object
+            required: [code, label]
+            properties:
+              code:
+                $ref: "#/components/schemas/CategoryCode"
+              label:
+                type: string
+        levels:
+          type: array
+          items:
+            type: object
+            required: [code, label]
+            properties:
+              code:
+                $ref: "#/components/schemas/LevelCode"
+              label:
+                type: string
+        surfaces:
+          type: array
+          items:
+            type: object
+            required: [code, label]
+            properties:
+              code:
+                $ref: "#/components/schemas/SurfaceCode"
+              label:
+                type: string
+        tags:
+          type: array
+          items:
+            type: object
+            required: [code, label]
+            properties:
+              code:
+                $ref: "#/components/schemas/TagCode"
+              label:
+                type: string
+        organizerTypes:
+          type: array
+          items:
+            type: object
+            required: [code, label]
+            properties:
+              code:
+                $ref: "#/components/schemas/OrganizerTypeCode"
+              label:
+                type: string
+        regions:
+          type: array
+          items:
+            type: object
+            required: [code, name]
+            properties:
+              code:
+                type: string
+              name:
+                type: string
+        departments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Department"
+
+    Department:
+      type: object
+      required: [code, name, regionCode, isActive]
+      properties:
+        code:
+          $ref: "#/components/schemas/DepartmentCode"
+        name:
+          type: string
+          example: Finistère
+        regionCode:
+          type: string
+          example: "53"
+        isActive:
+          type: boolean
+          description: Département couvert par l'application
+
+    City:
+      type: object
+      required: [inseeCode, name, departmentCode, postalCodes]
+      properties:
+        inseeCode:
+          $ref: "#/components/schemas/InseeCode"
+        name:
+          type: string
+          example: Carnac
+        departmentCode:
+          $ref: "#/components/schemas/DepartmentCode"
+        postalCodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/PostalCode"
+
+    CityRef:
+      type: object
+      description: Commune résumée
+      required: [inseeCode, name, departmentCode]
+      properties:
+        inseeCode:
+          $ref: "#/components/schemas/InseeCode"
+        name:
+          type: string
+        departmentCode:
+          $ref: "#/components/schemas/DepartmentCode"
+
+    # ---- Médias ----------------------------------------------------------------
+    Image:
+      type: object
+      description: Image publique en deux tailles
+      required: [thumbUrl, largeUrl, width, height]
+      properties:
+        thumbUrl:
+          type: string
+          format: uri
+          description: Vignette (400 px de large)
+        largeUrl:
+          type: string
+          format: uri
+          description: Grand format (1200 px de large)
+        width:
+          type: integer
+        height:
+          type: integer
+
+    Media:
+      type: object
+      required: [id, kind, image, isPublic, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          $ref: "#/components/schemas/MediaKind"
+        image:
+          $ref: "#/components/schemas/Image"
+        isPublic:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+
+    # ---- Tournois : vues publiques ---------------------------------------------
+    DivisionSummary:
+      type: object
+      description: Caractéristiques agrégées des tableaux, pour les cartes de la liste
+      required: [formats, categories, levels, surfaces, minPriceCents]
+      properties:
+        formats:
+          type: array
+          items:
+            $ref: "#/components/schemas/FormatCode"
+        categories:
+          type: array
+          items:
+            $ref: "#/components/schemas/CategoryCode"
+        levels:
+          type: array
+          items:
+            $ref: "#/components/schemas/LevelCode"
+        surfaces:
+          type: array
+          items:
+            $ref: "#/components/schemas/SurfaceCode"
+        minPriceCents:
+          type: integer
+          nullable: true
+          description: Prix le plus bas parmi les tableaux (null si non communiqué)
+
+    TournamentSummary:
+      type: object
+      description: Tournoi tel qu'affiché dans une liste (carte)
+      required:
+        - id
+        - name
+        - startDate
+        - endDate
+        - city
+        - organizerName
+        - divisionSummary
+        - tags
+        - registrationStatus
+        - eventStatus
+        - closingSoon
+        - isPast
+        - startTime
+        - venueName
+        - poster
+        - postponedToDate
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: Tournoi de la Grande Plage
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: string
+          format: date
+        startTime:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/Time"
+          nullable: true
+        city:
+          $ref: "#/components/schemas/CityRef"
+        venueName:
+          type: string
+          nullable: true
+        organizerName:
+          type: string
+        poster:
+          type: object
+          allOf:
+            - $ref: "#/components/schemas/Image"
+          nullable: true
+          description: null = afficher le visuel générique du terrain (RG-12)
+        divisionSummary:
+          $ref: "#/components/schemas/DivisionSummary"
+        tags:
+          type: array
+          items:
+            $ref: "#/components/schemas/TagCode"
+        registrationStatus:
+          $ref: "#/components/schemas/RegistrationStatus"
+        eventStatus:
+          $ref: "#/components/schemas/EventStatus"
+        postponedToDate:
+          type: string
+          format: date
+          nullable: true
+        closingSoon:
+          type: boolean
+          description: Badge calculé « Inscriptions bientôt clôturées » (RG-08)
+        isPast:
+          type: boolean
+
+    TournamentSummaryPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/TournamentSummary"
+        nextCursor:
+          type: string
+          nullable: true
+          description: null = dernière page
+
+    Division:
+      type: object
+      description: Tableau d'un tournoi
+      required: [id, format, category, surface, levels, playersPerTeamMin, playersPerTeamMax, priceCents, priceUnit, maxTeams, scheduleNote, conditions]
+      properties:
+        id:
+          type: string
+          format: uuid
+        format:
+          $ref: "#/components/schemas/FormatCode"
+        category:
+          $ref: "#/components/schemas/CategoryCode"
+        surface:
+          $ref: "#/components/schemas/SurfaceCode"
+        levels:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/LevelCode"
+        playersPerTeamMin:
+          type: integer
+          minimum: 1
+          maximum: 12
+        playersPerTeamMax:
+          type: integer
+          minimum: 1
+          maximum: 12
+        priceCents:
+          type: integer
+          nullable: true
+          description: null = non communiqué ; 0 = gratuit
+        priceUnit:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/PriceUnit"
+          nullable: true
+        maxTeams:
+          type: integer
+          nullable: true
+        scheduleNote:
+          type: string
+          nullable: true
+        conditions:
+          type: string
+          nullable: true
+
+    VenuePublic:
+      type: object
+      required: [city, latitude, longitude, name, addressLine, postalCode, isApproximate]
+      properties:
+        name:
+          type: string
+          nullable: true
+        addressLine:
+          type: string
+          nullable: true
+        postalCode:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/PostalCode"
+          nullable: true
+        city:
+          $ref: "#/components/schemas/CityRef"
+        latitude:
+          $ref: "#/components/schemas/Latitude"
+        longitude:
+          $ref: "#/components/schemas/Longitude"
+        isApproximate:
+          type: boolean
+          description: true si la position est le centre de la commune
+
+    Registration:
+      type: object
+      required: [mode, status, url, instructions, deadline]
+      properties:
+        mode:
+          $ref: "#/components/schemas/RegistrationMode"
+        status:
+          $ref: "#/components/schemas/RegistrationStatus"
+        url:
+          type: string
+          format: uri
+          nullable: true
+        instructions:
+          type: string
+          nullable: true
+        deadline:
+          type: string
+          format: date
+          nullable: true
+
+    Contact:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+          nullable: true
+        phone:
+          type: string
+          nullable: true
+        url:
+          type: string
+          format: uri
+          nullable: true
+
+      required: [email, phone, url]
+    OrganizerRef:
+      type: object
+      required: [id, name, type, logo]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        type:
+          $ref: "#/components/schemas/OrganizerTypeCode"
+        logo:
+          type: object
+          allOf:
+            - $ref: "#/components/schemas/Image"
+          nullable: true
+
+    EditionRef:
+      type: object
+      description: Autre édition de la même série
+      required: [id, name, startDate]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        startDate:
+          type: string
+          format: date
+
+    TournamentDetail:
+      description: Fiche tournoi complète (vue publique)
+      allOf:
+        - $ref: "#/components/schemas/TournamentSummary"
+        - type: object
+          required: [organizer, venue, registration, contact, divisions, verifiedAt, otherEditions, seriesId, description, rulesText, rulesUrl]
+          properties:
+            organizer:
+              $ref: "#/components/schemas/OrganizerRef"
+            seriesId:
+              type: string
+              format: uuid
+            venue:
+              $ref: "#/components/schemas/VenuePublic"
+            description:
+              type: string
+              nullable: true
+            rulesText:
+              type: string
+              nullable: true
+            rulesUrl:
+              type: string
+              format: uri
+              nullable: true
+            registration:
+              $ref: "#/components/schemas/Registration"
+            contact:
+              $ref: "#/components/schemas/Contact"
+            divisions:
+              type: array
+              description: Détail de chaque tableau, dans l'ordre d'affichage
+              items:
+                $ref: "#/components/schemas/Division"
+            verifiedAt:
+              type: string
+              format: date-time
+              description: Affiché « Vérifié le … » (RG-07)
+            otherEditions:
+              type: array
+              description: Autres éditions publiées de la même série (historique)
+              items:
+                $ref: "#/components/schemas/EditionRef"
+
+    TournamentEventInput:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [view, registration_click]
+
+    # ---- Organisateurs ---------------------------------------------------------
+    OrganizerPublic:
+      type: object
+      required: [id, name, type, description, city, logo, email, phone, websiteUrl, facebookUrl, instagramUrl]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        type:
+          $ref: "#/components/schemas/OrganizerTypeCode"
+        description:
+          type: string
+          nullable: true
+        city:
+          type: object
+          allOf:
+            - $ref: "#/components/schemas/CityRef"
+          nullable: true
+        logo:
+          type: object
+          allOf:
+            - $ref: "#/components/schemas/Image"
+          nullable: true
+        email:
+          type: string
+          format: email
+          nullable: true
+        phone:
+          type: string
+          nullable: true
+        websiteUrl:
+          type: string
+          format: uri
+          nullable: true
+        facebookUrl:
+          type: string
+          format: uri
+          nullable: true
+        instagramUrl:
+          type: string
+          format: uri
+          nullable: true
+
+    # ---- Contributions ---------------------------------------------------------
+    SubmissionInput:
+      type: object
+      description: |
+        Formulaire « Proposer un tournoi ». Champs obligatoires réduits au
+        minimum (CTB-01). `website` est un champ « pot de miel » invisible :
+        s'il est rempli, la proposition est ignorée silencieusement (anti-spam).
+      required: [tournamentName, startDate, cityName, formats]
+      properties:
+        tournamentName:
+          type: string
+          minLength: 2
+          maxLength: 150
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: string
+          format: date
+        cityName:
+          type: string
+          minLength: 1
+          maxLength: 100
+        cityInsee:
+          $ref: "#/components/schemas/InseeCode"
+        venueOrAddress:
+          type: string
+          maxLength: 250
+        organizerName:
+          type: string
+          maxLength: 150
+        formats:
+          type: array
+          minItems: 1
+          maxItems: 5
+          items:
+            $ref: "#/components/schemas/FormatCode"
+        categories:
+          type: array
+          items:
+            $ref: "#/components/schemas/CategoryCode"
+        levels:
+          type: array
+          items:
+            $ref: "#/components/schemas/LevelCode"
+        surfaces:
+          type: array
+          items:
+            $ref: "#/components/schemas/SurfaceCode"
+        priceInfo:
+          type: string
+          maxLength: 200
+          description: Texte libre (« 10 € par joueur »)
+        registrationUrl:
+          $ref: "#/components/schemas/HttpUrl"
+        sourceUrl:
+          allOf:
+            - $ref: "#/components/schemas/HttpUrl"
+          description: Où l'information a été vue (post Facebook, site…)
+        description:
+          type: string
+          maxLength: 5000
+        posterMediaId:
+          type: string
+          format: uuid
+        submitterEmail:
+          allOf:
+            - $ref: "#/components/schemas/Email"
+          description: Facultatif, pour être recontacté
+        isOrganizer:
+          type: boolean
+          description: Le proposant est l'organisateur du tournoi
+        website:
+          type: string
+          maxLength: 200
+          description: Pot de miel anti-spam — doit rester vide
+
+    ReportInput:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          $ref: "#/components/schemas/ReportReason"
+        comment:
+          type: string
+          maxLength: 1000
+        website:
+          type: string
+          maxLength: 200
+          description: Pot de miel anti-spam — doit rester vide
+
+    # ---- Authentification et compte ------------------------------------------
+    ClientType:
+      type: string
+      enum: [mobile, web]
+      default: mobile
+      description: |
+        `mobile` : le jeton de renouvellement est renvoyé dans le corps.
+        `web` : il est placé dans un cookie HttpOnly et absent du corps.
+
+    RegisterInput:
+      type: object
+      required: [email, password, acceptPrivacyPolicy]
+      properties:
+        email:
+          $ref: "#/components/schemas/Email"
+        password:
+          $ref: "#/components/schemas/Password"
+        displayName:
+          type: string
+          minLength: 2
+          maxLength: 50
+        acceptPrivacyPolicy:
+          type: boolean
+          enum: [true]
+          description: Doit valoir true
+        client:
+          $ref: "#/components/schemas/ClientType"
+
+    LoginInput:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          $ref: "#/components/schemas/Email"
+        password:
+          type: string
+          maxLength: 128
+        client:
+          $ref: "#/components/schemas/ClientType"
+
+    RefreshInput:
+      type: object
+      properties:
+        refreshToken:
+          type: string
+          maxLength: 200
+          description: Obligatoire pour l'application mobile ; absent pour le web (cookie)
+        client:
+          $ref: "#/components/schemas/ClientType"
+
+    TokenInput:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+          minLength: 20
+          maxLength: 200
+
+    AuthSession:
+      type: object
+      required: [accessToken, accessTokenExpiresAt, user]
+      properties:
+        accessToken:
+          type: string
+          description: "JWT à envoyer dans l'en-tête Authorization: Bearer …"
+        accessTokenExpiresAt:
+          type: string
+          format: date-time
+        refreshToken:
+          type: string
+          description: Présent uniquement pour `client = mobile`
+        refreshTokenExpiresAt:
+          type: string
+          format: date-time
+        user:
+          $ref: "#/components/schemas/User"
+
+    User:
+      type: object
+      required: [id, email, role, emailVerified, createdAt, displayName, preferredDepartmentCode]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          $ref: "#/components/schemas/Email"
+        displayName:
+          type: string
+          nullable: true
+        role:
+          $ref: "#/components/schemas/Role"
+        preferredDepartmentCode:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/DepartmentCode"
+          nullable: true
+        emailVerified:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+
+    UpdateMeInput:
+      type: object
+      minProperties: 1
+      properties:
+        displayName:
+          type: string
+          minLength: 2
+          maxLength: 50
+          nullable: true
+        preferredDepartmentCode:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/DepartmentCode"
+          nullable: true
+
+    # ---- Administration : tournois ---------------------------------------------
+    AdminDashboard:
+      type: object
+      required:
+        - pendingSubmissions
+        - openReports
+        - pendingTournaments
+        - upcomingPublished30Days
+        - staleTournaments
+      properties:
+        pendingSubmissions:
+          type: integer
+        openReports:
+          type: integer
+        pendingTournaments:
+          type: integer
+        upcomingPublished30Days:
+          type: integer
+          description: Tournois publiés dans les 30 prochains jours
+        staleTournaments:
+          type: integer
+          description: Tournois à venir non vérifiés depuis plus de 30 jours
+
+    AdminTournamentSummary:
+      description: Ligne de la liste du back-office
+      allOf:
+        - $ref: "#/components/schemas/TournamentSummary"
+        - type: object
+          required: [publicationStatus, seriesId, verifiedAt, updatedAt]
+          properties:
+            publicationStatus:
+              $ref: "#/components/schemas/PublicationStatus"
+            seriesId:
+              type: string
+              format: uuid
+            verifiedAt:
+              type: string
+              format: date-time
+            updatedAt:
+              type: string
+              format: date-time
+
+    AdminTournamentSummaryPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminTournamentSummary"
+        nextCursor:
+          type: string
+          nullable: true
+
+    AdminTournament:
+      description: Tournoi complet pour le back-office (inclut les champs internes)
+      allOf:
+        - $ref: "#/components/schemas/TournamentDetail"
+        - type: object
+          required: [publicationStatus, seriesId, venueId, createdAt, updatedAt, rejectionReason, publishedAt, posterMediaId, sourceNote, submissionId, openReportsCount]
+          properties:
+            publicationStatus:
+              $ref: "#/components/schemas/PublicationStatus"
+            rejectionReason:
+              type: string
+              nullable: true
+            publishedAt:
+              type: string
+              format: date-time
+              nullable: true
+            venueId:
+              type: string
+              format: uuid
+            posterMediaId:
+              type: string
+              format: uuid
+              nullable: true
+            sourceNote:
+              type: string
+              nullable: true
+              description: Interne — jamais exposé publiquement
+            submissionId:
+              type: string
+              format: uuid
+              nullable: true
+              description: Proposition d'origine, le cas échéant
+            openReportsCount:
+              type: integer
+            createdAt:
+              type: string
+              format: date-time
+            updatedAt:
+              type: string
+              format: date-time
+
+    DivisionInput:
+      type: object
+      required: [format, category, surface, levels, playersPerTeamMin, playersPerTeamMax]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Absent = nouveau tableau ; présent = tableau existant à mettre à jour
+        format:
+          $ref: "#/components/schemas/FormatCode"
+        category:
+          $ref: "#/components/schemas/CategoryCode"
+        surface:
+          $ref: "#/components/schemas/SurfaceCode"
+        levels:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/LevelCode"
+        playersPerTeamMin:
+          type: integer
+          minimum: 1
+          maximum: 12
+        playersPerTeamMax:
+          type: integer
+          minimum: 1
+          maximum: 12
+        priceCents:
+          type: integer
+          minimum: 0
+          maximum: 100000
+          nullable: true
+        priceUnit:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/PriceUnit"
+          nullable: true
+        maxTeams:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          nullable: true
+        scheduleNote:
+          type: string
+          maxLength: 200
+          nullable: true
+        conditions:
+          type: string
+          maxLength: 1000
+          nullable: true
+
+    TournamentContentInput:
+      type: object
+      description: Champs éditables d'une édition (communs à la création et à la modification)
+      required: [name, startDate, registrationMode, registrationStatus, eventStatus, divisions]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 150
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: string
+          format: date
+          description: Par défaut égale à startDate
+        startTime:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/Time"
+          nullable: true
+        posterMediaId:
+          type: string
+          format: uuid
+          nullable: true
+        description:
+          type: string
+          maxLength: 10000
+          nullable: true
+        rulesText:
+          type: string
+          maxLength: 20000
+          nullable: true
+        rulesUrl:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/HttpUrl"
+          nullable: true
+        registrationMode:
+          $ref: "#/components/schemas/RegistrationMode"
+        registrationUrl:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/HttpUrl"
+          nullable: true
+          description: Obligatoire si registrationMode = external_link
+        registrationInstructions:
+          type: string
+          maxLength: 500
+          nullable: true
+        registrationDeadline:
+          type: string
+          format: date
+          nullable: true
+        registrationStatus:
+          $ref: "#/components/schemas/RegistrationStatus"
+        eventStatus:
+          $ref: "#/components/schemas/EventStatus"
+        postponedToDate:
+          type: string
+          format: date
+          nullable: true
+          description: Uniquement si eventStatus = postponed
+        tags:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/TagCode"
+        contactEmail:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/Email"
+          nullable: true
+        contactPhone:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/Phone"
+          nullable: true
+        contactUrl:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/HttpUrl"
+          nullable: true
+        sourceNote:
+          type: string
+          maxLength: 1000
+          nullable: true
+        divisions:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            $ref: "#/components/schemas/DivisionInput"
+
+    NewSeriesInput:
+      type: object
+      required: [organizerId, name]
+      properties:
+        organizerId:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 2
+          maxLength: 150
+
+    AdminTournamentCreateInput:
+      description: |
+        Création : exactement un parmi `seriesId` / `newSeries`, et exactement
+        un parmi `venueId` / `newVenue` (vérifié par l'API, 422 sinon).
+      allOf:
+        - $ref: "#/components/schemas/TournamentContentInput"
+        - type: object
+          properties:
+            seriesId:
+              type: string
+              format: uuid
+            newSeries:
+              $ref: "#/components/schemas/NewSeriesInput"
+            venueId:
+              type: string
+              format: uuid
+            newVenue:
+              $ref: "#/components/schemas/VenueInput"
+            submissionId:
+              type: string
+              format: uuid
+              description: Proposition acceptée par cette création
+
+    AdminTournamentUpdateInput:
+      allOf:
+        - $ref: "#/components/schemas/TournamentContentInput"
+        - type: object
+          required: [venueId, version]
+          properties:
+            venueId:
+              type: string
+              format: uuid
+            version:
+              type: string
+              format: date-time
+              description: Valeur de `updatedAt` lue avant modification (verrouillage optimiste)
+
+    DuplicateInput:
+      type: object
+      required: [startDate]
+      properties:
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: string
+          format: date
+        name:
+          type: string
+          minLength: 2
+          maxLength: 150
+          description: Par défaut, le nom de l'édition copiée (sans l'année éventuelle)
+
+    TournamentStats:
+      type: object
+      required: [totalViews, totalRegistrationClicks, days]
+      properties:
+        totalViews:
+          type: integer
+        totalRegistrationClicks:
+          type: integer
+        days:
+          type: array
+          items:
+            type: object
+            required: [day, views, registrationClicks]
+            properties:
+              day:
+                type: string
+                format: date
+              views:
+                type: integer
+              registrationClicks:
+                type: integer
+
+    AuditEntry:
+      type: object
+      required: [id, action, createdAt, actor, changes]
+      properties:
+        id:
+          type: integer
+          format: int64
+        action:
+          type: string
+          example: publish
+        actor:
+          type: object
+          nullable: true
+          required: [id, displayName]
+          properties:
+            id:
+              type: string
+              format: uuid
+            displayName:
+              type: string
+              nullable: true
+        changes:
+          type: object
+          nullable: true
+          additionalProperties: true
+        createdAt:
+          type: string
+          format: date-time
+
+    AuditEntryPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEntry"
+        nextCursor:
+          type: string
+          nullable: true
+
+    # ---- Administration : séries -----------------------------------------------
+    Series:
+      type: object
+      required: [id, name, organizer, editionsCount, lastEditionDate]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        organizer:
+          $ref: "#/components/schemas/OrganizerRef"
+        editionsCount:
+          type: integer
+        lastEditionDate:
+          type: string
+          format: date
+          nullable: true
+
+    SeriesPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Series"
+        nextCursor:
+          type: string
+          nullable: true
+
+    SeriesUpdateInput:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 150
+        organizerId:
+          type: string
+          format: uuid
+
+    # ---- Administration : organisateurs ----------------------------------------
+    OrganizerInput:
+      type: object
+      required: [name, type]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 150
+        type:
+          $ref: "#/components/schemas/OrganizerTypeCode"
+        description:
+          type: string
+          maxLength: 5000
+          nullable: true
+        cityInsee:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/InseeCode"
+          nullable: true
+        logoMediaId:
+          type: string
+          format: uuid
+          nullable: true
+        email:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/Email"
+          nullable: true
+        phone:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/Phone"
+          nullable: true
+        websiteUrl:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/HttpUrl"
+          nullable: true
+        facebookUrl:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/HttpUrl"
+          nullable: true
+        instagramUrl:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/HttpUrl"
+          nullable: true
+
+    AdminOrganizer:
+      allOf:
+        - $ref: "#/components/schemas/OrganizerPublic"
+        - type: object
+          required: [seriesCount, createdAt, updatedAt, logoMediaId]
+          properties:
+            logoMediaId:
+              type: string
+              format: uuid
+              nullable: true
+            seriesCount:
+              type: integer
+            createdAt:
+              type: string
+              format: date-time
+            updatedAt:
+              type: string
+              format: date-time
+
+    AdminOrganizerPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminOrganizer"
+        nextCursor:
+          type: string
+          nullable: true
+
+    # ---- Administration : lieux ------------------------------------------------
+    VenueInput:
+      type: object
+      required: [cityInsee, latitude, longitude, geocodingSource]
+      properties:
+        name:
+          type: string
+          maxLength: 150
+          nullable: true
+        addressLine:
+          type: string
+          maxLength: 250
+          nullable: true
+        postalCode:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/PostalCode"
+          nullable: true
+        cityInsee:
+          $ref: "#/components/schemas/InseeCode"
+        latitude:
+          $ref: "#/components/schemas/Latitude"
+        longitude:
+          $ref: "#/components/schemas/Longitude"
+        geocodingSource:
+          type: string
+          enum: [ban, city_center, manual]
+
+    Venue:
+      type: object
+      required: [id, city, latitude, longitude, geocodingSource, name, addressLine, postalCode]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          nullable: true
+        addressLine:
+          type: string
+          nullable: true
+        postalCode:
+          type: string
+          nullable: true
+        city:
+          $ref: "#/components/schemas/CityRef"
+        latitude:
+          $ref: "#/components/schemas/Latitude"
+        longitude:
+          $ref: "#/components/schemas/Longitude"
+        geocodingSource:
+          type: string
+          enum: [ban, city_center, manual]
+
+    VenuePage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Venue"
+        nextCursor:
+          type: string
+          nullable: true
+
+    GeocodeSuggestion:
+      type: object
+      required: [label, cityInsee, cityName, latitude, longitude, score, addressLine, postalCode]
+      properties:
+        label:
+          type: string
+          description: Adresse complète normalisée
+          example: Boulevard de la Plage 56340 Carnac
+        addressLine:
+          type: string
+          nullable: true
+        postalCode:
+          type: string
+          nullable: true
+        cityInsee:
+          $ref: "#/components/schemas/InseeCode"
+        cityName:
+          type: string
+        latitude:
+          $ref: "#/components/schemas/Latitude"
+        longitude:
+          $ref: "#/components/schemas/Longitude"
+        score:
+          type: number
+          description: Pertinence (0 à 1)
+
+    # ---- Administration : modération -------------------------------------------
+    Submission:
+      type: object
+      required: [id, status, data, createdAt, poster, submittedByUserId, createdTournamentId, rejectionReason, reviewedAt, possibleDuplicates]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          $ref: "#/components/schemas/SubmissionStatus"
+        data:
+          $ref: "#/components/schemas/SubmissionInput"
+        poster:
+          type: object
+          allOf:
+            - $ref: "#/components/schemas/Image"
+          nullable: true
+        submittedByUserId:
+          type: string
+          format: uuid
+          nullable: true
+        createdTournamentId:
+          type: string
+          format: uuid
+          nullable: true
+        rejectionReason:
+          type: string
+          nullable: true
+        reviewedAt:
+          type: string
+          format: date-time
+          nullable: true
+        possibleDuplicates:
+          type: array
+          description: Tournois existants ressemblant à la proposition (RG-10)
+          items:
+            $ref: "#/components/schemas/AdminTournamentSummary"
+        createdAt:
+          type: string
+          format: date-time
+
+    SubmissionPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Submission"
+        nextCursor:
+          type: string
+          nullable: true
+
+    Report:
+      type: object
+      required: [id, tournament, reason, status, createdAt, comment, resolvedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        tournament:
+          type: object
+          required: [id, name, startDate]
+          properties:
+            id:
+              type: string
+              format: uuid
+            name:
+              type: string
+            startDate:
+              type: string
+              format: date
+        reason:
+          $ref: "#/components/schemas/ReportReason"
+        comment:
+          type: string
+          nullable: true
+        status:
+          $ref: "#/components/schemas/ReportStatus"
+        resolvedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    ReportPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Report"
+        nextCursor:
+          type: string
+          nullable: true
