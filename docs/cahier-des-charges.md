@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Version** | 1.0 — à valider |
+| **Version** | 1.1 — validée |
 | **Date** | 1er novembre 2026 |
 | **Nom de travail** | VolleySpot (provisoire) |
-| **Statut** | Rédigé à l'issue de l'entretien de cadrage (phase 1) |
+| **Statut** | Validé le 1er novembre 2026 (phase 1 terminée) |
 
 > Ce document est la référence de toutes les étapes suivantes. Toute modification du périmètre doit y être reportée (avec une nouvelle version) avant d'être développée.
 
@@ -60,7 +60,7 @@ Les deux différenciateurs, qui guident toutes les priorités :
 
 ### 1.4 Périmètre géographique
 
-- **Lancement : Bretagne** (région pilote) — Côtes-d'Armor (22), Finistère (29), Ille-et-Vilaine (35), Morbihan (56).
+- **Lancement : Bretagne historique** (zone pilote) — Côtes-d'Armor (22), Finistère (29), Ille-et-Vilaine (35), Morbihan (56) et Loire-Atlantique (44, rattachée administrativement aux Pays de la Loire).
 - **Architecture prévue dès le départ pour la France métropolitaine** (toutes les régions et départements présents en base, activation progressive).
 - Hors périmètre : DOM-TOM, pays étrangers.
 
@@ -364,7 +364,7 @@ C'est le facteur clé de succès : l'app n'a de valeur que si le catalogue est c
 | **Duplication d'éditions** | Les tournois récurrents sont republiés chaque année en quelques secondes | Croissante d'année en année |
 | **Propositions** | Joueurs et organisateurs proposent des tournois via l'app | Croissante avec l'audience |
 
-**Objectif de lancement : au moins 20 tournois bretons à venir publiés** au moment de la mise en ligne.
+**Objectif de lancement : au moins 20 tournois à venir publiés dans la zone pilote** au moment de la mise en ligne.
 
 ### 10.2 Collecte automatisée — analyse et décision
 
@@ -438,7 +438,7 @@ C'est le facteur clé de succès : l'app n'a de valeur que si le catalogue est c
 
 **Budget cible : moins de 10 €/mois d'hébergement**, hors frais ponctuels des stores et du domaine.
 
-> **Point de décision (voir 16)** : la base de données sur Neon/Supabase (≈ 0 €) est retenue par défaut pour respecter le budget ; Cloud SQL (≈ 10-15 €/mois, plus formateur sur GCP) reste possible sans modification de code.
+> **Décision** : la base de données sur Neon/Supabase (≈ 0 €) est retenue pour le MVP ; Cloud SQL (≈ 10-15 €/mois) reste possible plus tard sans modification de code.
 
 ---
 
@@ -446,7 +446,7 @@ C'est le facteur clé de succès : l'app n'a de valeur que si le catalogue est c
 
 | Indicateur | Objectif à 3 mois après le lancement |
 |---|---|
-| Tournois bretons à venir publiés | ≥ 20 au lancement, ≥ 40 sur la saison |
+| Tournois à venir publiés (zone pilote) | ≥ 20 au lancement, ≥ 40 sur la saison |
 | Utilisateurs actifs mensuels | 100 |
 | Clics « S'inscrire » | 200 cumulés |
 | Propositions reçues de la communauté | 5 |
@@ -486,11 +486,11 @@ Chaque phase se termine par une présentation des résultats et une **validation
 
 | # | Sujet | Hypothèse retenue | À confirmer |
 |---|---|---|---|
-| H1 | Temps disponible | 6 à 8 h par semaine | ❓ Votre disponibilité réelle (impacte le calendrier) |
-| H2 | Base de données | Neon ou Supabase (gratuit) au MVP, Cloud SQL plus tard | ❓ Ou Cloud SQL dès le départ (~10-15 €/mois) |
-| H3 | Loire-Atlantique (44) | **Non incluse** au lancement (région administrative Pays de la Loire) | ❓ Beaucoup de tournois beach (La Baule, Pornic…) : l'inclure dans la zone pilote ? |
-| H4 | Nom de l'application | « VolleySpot » provisoire | ❓ Nom définitif à choisir avant la phase 7 |
-| H5 | Niveau du porteur | Débutant en TypeScript / React ; notions de Go | ❓ À ajuster pour le niveau d'explication |
+| H1 | Temps disponible | 6 à 8 h par semaine | ✅ Confirmé |
+| H2 | Base de données | Neon ou Supabase (gratuit) au MVP, Cloud SQL plus tard | ✅ Confirmé |
+| H3 | Loire-Atlantique (44) | **Incluse** dans la zone pilote | ✅ Confirmé |
+| H4 | Nom de l'application | « VolleySpot » provisoire | ✅ Confirmé — nom définitif à choisir avant la phase 7 |
+| H5 | Niveau du porteur | Débutant en TypeScript / React ; notions de Go | ✅ Confirmé |
 
 ---
 
