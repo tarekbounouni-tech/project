@@ -17,4 +17,5 @@ Application mobile pour centraliser les tournois de volley-ball libres en France
 ## Documentation
 
 - [Cahier des charges fonctionnel](docs/cahier-des-charges.md) — v1.1, validé
-- [2.1 Architecture logicielle](docs/02-architecture.md) — à valider
+- [2.1 Architecture logicielle](docs/02-architecture.md) — validée
+- [2.2 Modèle de données](docs/03-modele-donnees.md) — à valider ([scripts SQL](backend/db/migrations))

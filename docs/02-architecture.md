@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Version** | 1.0 — à valider |
+| **Version** | 1.0 — validée |
 | **Date** | 1er novembre 2026 |
 | **Référence** | [Cahier des charges v1.1](cahier-des-charges.md) |
 
